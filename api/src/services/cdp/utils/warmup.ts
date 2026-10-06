@@ -1,5 +1,6 @@
 import { FastifyBaseLogger } from "fastify";
 import { Page } from "puppeteer-core";
+import { observeWarmupAssets } from "./warmup-observability.js";
 
 export type WarmupPhase = "navigation" | "readiness" | "deadline";
 
@@ -45,6 +46,15 @@ export async function runPageWarmup(
   const startedAt = Date.now();
   const deadline = startedAt + timeoutMs;
   const budget = () => Math.max(deadline - Date.now(), 1);
+  const stopObserving =
+    process.env.STEEL_WARMUP_ASSET_TELEMETRY === "1"
+      ? observeWarmupAssets(page, url, logger)
+      : undefined;
+  let outcome: "ready" | "failed" = "failed";
+  let phase: WarmupPhase | "complete" = "navigation";
+  let readinessStartedAt: number | undefined;
+  let readinessDurationMs: number | undefined;
+  let readinessOutcome = readyExpression ? "not_started" : "not_requested";
 
   const warm = async (): Promise<void> => {
     if (initScript) {
@@ -58,13 +68,19 @@ export async function runPageWarmup(
     }
 
     if (readyExpression) {
+      readinessStartedAt = Date.now();
+      readinessOutcome = "pending";
       try {
         // Pass the raw string: puppeteer evaluates it via Runtime.evaluate,
         // which is CSP-immune and sidesteps the esbuild __name serialization
         // workaround that function-valued evaluate needs.
         await page.waitForFunction(readyExpression, { polling: 100, timeout: budget() });
+        readinessOutcome = "ready";
       } catch (error) {
+        readinessOutcome = "failed";
         throw new WarmupFailedError(url, "readiness", error);
+      } finally {
+        readinessDurationMs = Date.now() - readinessStartedAt;
       }
     }
   };
@@ -89,12 +105,31 @@ export async function runPageWarmup(
     // as an unhandled rejection.
     warmPromise.catch(() => {});
     await Promise.race([warmPromise, hardDeadline]);
+    outcome = "ready";
+    phase = "complete";
     logger.debug(`[Warmup] Page warmed at ${url} in ${Date.now() - startedAt}ms`);
   } catch (error) {
+    phase = error instanceof WarmupFailedError ? error.phase : "navigation";
     throw error instanceof WarmupFailedError
       ? error
       : new WarmupFailedError(url, "navigation", error);
   } finally {
     clearTimeout(hardDeadlineTimer);
+    stopObserving?.();
+    logger.info(
+      {
+        event: "steel.warmup.completed",
+        outcome,
+        phase,
+        duration_ms: Date.now() - startedAt,
+        readiness_outcome: readinessOutcome === "pending" ? "deadline" : readinessOutcome,
+        ...(readinessStartedAt === undefined
+          ? {}
+          : {
+              readiness_duration_ms: readinessDurationMs ?? Date.now() - readinessStartedAt,
+            }),
+      },
+      "Page warmup completed",
+    );
   }
 }

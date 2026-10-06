@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { EventEmitter } from "node:events";
 
 import { runPageWarmup, WarmupFailedError } from "./warmup.js";
 
@@ -24,6 +25,7 @@ const createPage = () => ({
 describe("runPageWarmup", () => {
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllEnvs();
   });
 
   it("evaluates the init script on new documents before navigating", async () => {
@@ -158,5 +160,113 @@ describe("runPageWarmup", () => {
 
     expect(page.goto).toHaveBeenCalledOnce();
     expect(page.close).not.toHaveBeenCalled();
+  });
+
+  it("reports a readiness result and duration once, even when bootstrap JS returns 403", async () => {
+    vi.stubEnv("STEEL_WARMUP_ASSET_TELEMETRY", "1");
+    const page = Object.assign(new EventEmitter(), createPage());
+    const logger = createLogger();
+    page.goto.mockImplementationOnce(async () => {
+      page.emit("requestfinished", {
+        resourceType: () => "script",
+        url: () => "https://render.example.com/_next/static/app.js?token=private",
+        response: () => ({ status: () => 403 }),
+      });
+    });
+    page.waitForFunction.mockRejectedValueOnce(new Error("readiness timed out"));
+    await expect(
+      runPageWarmup(
+        page as any,
+        {
+          url: warmupUrl,
+          readyExpression: "!!window.ready",
+          timeoutMs: 5000,
+        },
+        logger,
+      ),
+    ).rejects.toMatchObject({ phase: "readiness" });
+    expect(logger.info.mock.calls.map(([fields]: any[]) => fields)).toEqual([
+      { event: "steel.warmup.asset", asset_kind: "next_script", outcome: "forbidden" },
+      expect.objectContaining({
+        event: "steel.warmup.completed",
+        outcome: "failed",
+        phase: "readiness",
+        readiness_outcome: "failed",
+        readiness_duration_ms: expect.any(Number),
+        duration_ms: expect.any(Number),
+      }),
+    ]);
+    expect(JSON.stringify(logger.info.mock.calls)).not.toContain("private");
+    expect(page.listenerCount("requestfinished")).toBe(0);
+    expect(page.listenerCount("requestfailed")).toBe(0);
+  });
+
+  it("stops observing and reports unfinished readiness at the hard deadline", async () => {
+    vi.useFakeTimers();
+    vi.stubEnv("STEEL_WARMUP_ASSET_TELEMETRY", "1");
+    const page = Object.assign(new EventEmitter(), createPage());
+    const logger = createLogger();
+    page.waitForFunction.mockReturnValueOnce(new Promise(() => {}) as any);
+    const warmup = runPageWarmup(
+      page as any,
+      { url: warmupUrl, readyExpression: "false", timeoutMs: 5000 },
+      logger,
+    );
+    const expectation = expect(warmup).rejects.toMatchObject({ phase: "deadline" });
+    await vi.advanceTimersByTimeAsync(7000);
+    await expectation;
+    expect(logger.info).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        event: "steel.warmup.completed",
+        outcome: "failed",
+        phase: "deadline",
+        readiness_outcome: "deadline",
+        readiness_duration_ms: 7000,
+        duration_ms: 7000,
+      }),
+      "Page warmup completed",
+    );
+    expect(page.listenerCount("requestfinished")).toBe(0);
+    expect(page.listenerCount("requestfailed")).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not enable per-script logging by default and distinguishes skipped readiness", async () => {
+    vi.stubEnv("STEEL_WARMUP_ASSET_TELEMETRY", "");
+    const logger = createLogger();
+    await runPageWarmup(createPage() as any, { url: warmupUrl, timeoutMs: 5000 }, logger);
+    expect(logger.info).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        event: "steel.warmup.completed",
+        outcome: "ready",
+        phase: "complete",
+        readiness_outcome: "not_requested",
+      }),
+      "Page warmup completed",
+    );
+    expect(logger.info.mock.calls[0][0]).not.toHaveProperty("readiness_duration_ms");
+  });
+
+  it("records successful polling and distinguishes navigation failures before polling", async () => {
+    const page = createPage();
+    const logger = createLogger();
+    const options = { url: warmupUrl, readyExpression: "!!window.ready", timeoutMs: 5000 };
+    await runPageWarmup(page as any, options, logger);
+    expect(logger.info.mock.calls[0][0]).toMatchObject({
+      outcome: "ready",
+      phase: "complete",
+      readiness_outcome: "ready",
+      readiness_duration_ms: expect.any(Number),
+    });
+    page.goto.mockRejectedValueOnce(new Error("navigation failed"));
+    await expect(runPageWarmup(page as any, options, logger)).rejects.toMatchObject({
+      phase: "navigation",
+    });
+    expect(logger.info.mock.calls[1][0]).toMatchObject({
+      outcome: "failed",
+      phase: "navigation",
+      readiness_outcome: "not_started",
+    });
+    expect(logger.info.mock.calls[1][0]).not.toHaveProperty("readiness_duration_ms");
   });
 });

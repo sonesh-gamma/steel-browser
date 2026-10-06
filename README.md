@@ -342,6 +342,46 @@ curl -X POST http://0.0.0.0:3000/v1/pdf \
 ```
 </details>
 
+## Warmup observability
+
+Warm session creation navigates a page and optionally waits for a configured
+JavaScript readiness expression before returning the session. It emits one
+structured `info` log with `event: steel.warmup.completed` when that operation
+settles, including failures and the hard deadline:
+
+| Field | Meaning |
+| --- | --- |
+| `outcome` | `ready` or `failed`. `ready` means the configured warmup contract completed, not that an arbitrary user render was tested. |
+| `phase` | `complete`, or failure during `navigation`, `readiness`, or `deadline`. The existing navigation category also includes init-script installation errors. |
+| `duration_ms` | Elapsed wall time from warmup entry through settlement. It excludes browser launch and subsequent session recording in the control plane. |
+| `readiness_outcome` | `not_requested`, `not_started`, `ready`, `failed`, or `deadline`. |
+| `readiness_duration_ms` | Present only if readiness polling started. Includes failed waits; a hard-deadline observation measures elapsed time until the deadline. |
+
+Set `STEEL_WARMUP_ASSET_TELEMETRY=1` to also emit one structured `info` log per
+terminal same-origin `/_next/` script request **during warmup**, with
+`event: steel.warmup.asset`, `asset_kind: next_script`, and `outcome` equal to
+`ok`, `forbidden` (HTTP 403), `server_error`, `client_error`, `redirect`,
+`network_error`, or `unknown`. HTTP 304 counts as `ok`. Successes are included so
+the failure ratio uses the same request population as its denominator. This is
+off by default: budget one additional log per observed script request before
+enabling it across a fleet. Listeners attach before navigation and are removed
+when warmup settles, including failure and hard deadline.
+
+These events contain no request URL, query string, session ID, or error text.
+They use the existing API logger and container log collection; no metrics or
+tracing exporter is installed. Create log-derived counts filtered by the exact
+event name and distributions from the numeric duration fields. Preserve the
+deployment's environment, service, provider and slot filters. Correlate script
+403/5xx rates with readiness failures, warming occupancy, and claimable capacity.
+Missing events before deployment or while per-script telemetry is disabled are
+not evidence of zero failures.
+
+The script observer measures requested Next bootstrap scripts, not a proven list
+of indispensable scripts. Other origins, non-Next scripts, in-flight requests at
+warmup settlement, and requests after handoff are outside this population. A
+script failure can correlate with failed readiness without proving causation;
+an absent readiness expression only tests navigation completion.
+
 ## Get involved
 Steel browser is an open-source project, and we welcome contributions!
 - Questions/ideas/feedback? Come hangout on [Discord](https://discord.gg/steel-dev)
